@@ -1,0 +1,547 @@
+---
+title: "Rain gauge optimization v1"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Get the basin subcatchments for the upper Severn
+
+```{r}
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+library(tidyplots)
+library(ggsci)
+library(leaflet)
+library(htmltools)
+library(sf)
+library(terra)
+library(tidyterra)
+library(ggspatial)
+library(ncdf40)
+library(RColorBrewer)
+library(GGally)
+
+```
+
+## Load gis layers
+
+```{r}
+###--------------------------------------------------------
+
+flow_stations_meta<-readRDS("flow_stations_meta.rda")
+
+###load plynlimon
+
+Plyn_catch <- read_sf("Headwater_catchments/Plyn_catchments/data/Shapefile/ee2eeee5-e456-4e93-87e9-eee97ee149ee/PlynlimonCatchments.shp", crs=st_crs(27700))
+
+###Load river_net Plyn
+
+Plyn_RN <- read_sf("Headwater_catchments/Plyn_rivernet/data/Shapefile/PlynlimonRiverNetwork.shp" ,crs=st_crs(27700))
+
+
+###Load raster with 2023 LC data from CEH (10 m res)----------------------------------
+
+catchment_LMC<-terra::rast(x = "lmc2023 clip.tif")
+#All_LMC<-terra::rast(x = "C:/Users/khamisk/Dropbox/LCM_2023_10m/lcm-2023-10m_5816930/gblcm2023_10m.tif" )
+
+### Load DEM -----------------------------------------
+
+dem_Dolwen_1m <- terra::rast("dem_Dolwen_1m.tif")
+dem_Dolwen <- terra::rast("dem_Dolwen.tif")
+dem_wider <- terra::rast("dem_Dolwen_wider.tif")
+
+#### load other shapefiles
+catchment_Dolwen <- read_sf("54080/54080.shp")
+river_net_wider <- read_sf("54080_river_net/StreamLine_54080.shp"
+                           ,crs=st_crs(27700))
+river_net_Dolwen = read_sf("river_net_Dolwen.shp")
+river_net_CEH <- read_sf("River_net/DigitalRiverNetwork_50K_GB.shp",
+                         crs=st_crs(27700))
+
+#### Load soil info--------------------------------
+
+BGS_soil_shp<-read_sf("BGS_soil_parent.shp")
+
+BGS_HOST<-rast("HOST.tif")
+
+BGS_HOST<-terra::project(BGS_HOST,"EPSG:27700")
+
+BGS_soil_Dolwen<-st_intersection(x = BGS_soil_shp,y = catchment_Dolwen)
+
+BGS_HOST_Dolwen <- terra::crop(BGS_HOST,catchment_Dolwen,mask=T)
+
+#### clip plyn
+
+Plyn_RN_S = st_intersection(Plyn_RN, catchment_Dolwen)
+
+Plyn_catch_S<-Plyn_catch |>  filter( Catchment=="Severn")
+
+Plyn_RN_S_10k = st_intersection(river_net_Dolwen, Plyn_catch_S )
+
+
+```
+
+## Load the locations for gauge and weather station
+
+```{r}
+
+plyn_sites<-read_csv("Headwater_catchments/Plyn_sites_meta.csv")
+
+
+plyn_sites_bng <- st_as_sf(plyn_sites, coords = c("x","y"),crs=27700)
+
+
+```
+
+## rainfall analysis
+
+```{r}
+
+####
+rain_meta_cmd<-read_csv("rain_meta_for_CMD.csv")
+
+rain_meta_sf<-st_as_sf(x = rain_meta_cmd, coords = c("x_2", "y_2"), crs=27700) ## load location of rain gauges in the catchment
+
+###load rainfall
+
+ukgrid      <- "+init=epsg:27700"
+ukgrid2      <- "epsg:27700"
+latlong     <- "+init=epsg:4326"
+
+proj        <-ukgrid 
+HAD_names<-dir(path = "HAD_rainfall_annual/",full.names = T,pattern = ".nc")###check file path works!
+
+HAD_ann<-terra::rast(HAD_names)
+crs(HAD_ann)<-ukgrid2
+
+###crop to catchment
+
+HAD_Dolwen_ppn <- terra::crop(HAD_ann,catchment_Dolwen,mask=T)
+#HAD_Dolwen_ppn <- terra::crop(HAD_ann,grid_1km)
+
+HAD_Dolwen_ppn_mean<-mean(HAD_Dolwen_ppn)
+#HAD_Dolwen_ppn_range<-max(HAD_Dolwen_ppn) - min(HAD_Dolwen_ppn)
+
+##plot to check
+plot(HAD_Dolwen_ppn_mean)
+
+###create a shapefile polygon grid
+grid_1km <- HAD_Dolwen_ppn_mean %>% 
+  st_make_grid(cellsize = 1000, what ="polygons") %>% # grid of points
+  st_intersection(catchment_Dolwen)  
+
+
+grid_1km_point <- 
+HAD_Dolwen_ppn_mean %>% 
+  st_make_grid(cellsize = 1000, what ="centers") %>% # grid of points
+  st_intersection(catchment_Dolwen)  
+
+
+
+  
+###get points
+grid_1km_xy<-st_coordinates(grid_1km_point)
+#st_coordinates(grid_1km_sf)
+
+##convert to simple features
+grid_1km_sf<-st_sf(geom = grid_1km )
+
+##plot grid to check
+plot(grid_1km_xy)
+ 
+ 
+```
+
+## Calculate terrain variables
+
+```{r}
+###calc terrain metrics
+slope_ras<-terrain(dem_Dolwen, v="slope", neighbors=8) 
+aspect_ras<-terrain(dem_Dolwen, v="aspect", neighbors=8) 
+tri_ras<-terrain(dem_Dolwen, v="TRI", neighbors=8) ##Terrain Ruggedness Index see help fro more info
+
+
+
+dem_max<-terra::extract(dem_Dolwen[[1]],grid_1km_sf,fun=max)
+dem_mean<-terra::extract(dem_Dolwen[[1]],grid_1km_sf,fun=mean)
+dem_min<-terra::extract(dem_Dolwen[[1]],grid_1km_sf,fun=min)
+dem_var<-terra::extract(dem_Dolwen[[1]],grid_1km_sf,fun=var)
+slope_mean<-terra::extract(slope_ras,grid_1km_sf,fun=mean)
+slope_var<-terra::extract(slope_ras,grid_1km_sf,fun=var)
+aspect_mean<-terra::extract(aspect_ras,grid_1km_sf,fun=mean)
+aspect_var<-terra::extract(aspect_ras,grid_1km_sf,fun=var)
+tri_mean<-terra::extract(tri_ras,grid_1km_sf,fun=mean)
+tri_var<-terra::extract(tri_ras,grid_1km_sf,fun=var)
+PPN_mean<-terra::extract(HAD_Dolwen_ppn_mean,grid_1km_sf,fun=mean)
+
+###plot variables against x and y
+
+
+grid_1km_sf$max_elev<-dem_max$spat_3e42c6a1e8b_996_o8up7yuDdJ6XHBX
+grid_1km_sf$min_elev<-dem_min$spat_3e42c6a1e8b_996_o8up7yuDdJ6XHBX
+grid_1km_sf$var_elev<-dem_var$spat_3e42c6a1e8b_996_o8up7yuDdJ6XHBX
+grid_1km_sf$mean_elev<-dem_mean$spat_3e42c6a1e8b_996_o8up7yuDdJ6XHBX
+grid_1km_sf$range_elev<-dem_max$spat_3e42c6a1e8b_996_o8up7yuDdJ6XHBX - dem_min$spat_3e42c6a1e8b_996_o8up7yuDdJ6XHBX
+grid_1km_sf$mean_slope<-slope_mean$slope
+grid_1km_sf$var_slope<-slope_var$slope
+grid_1km_sf$mean_aspect<-aspect_mean$aspect
+grid_1km_sf$var_aspect<-aspect_var$aspect
+grid_1km_sf$mean_tri<-tri_mean$TRI
+grid_1km_sf$var_tri<-tri_var$TRI
+grid_1km_sf$mean_PPN<-PPN_mean$mean
+
+
+```
+
+##plot to assess relationship between variables
+
+```{r}
+### extract cells that match the point grid
+
+point_1km_sf<-st_intersection(grid_1km_sf,grid_1km_point)  
+
+
+point_1km_sf$x<-grid_1km_xy[,1]
+point_1km_sf$y<-grid_1km_xy[,2]
+
+
+rain_meta_sf2<- st_intersection(grid_1km_sf,rain_meta_sf)
+
+rain_meta_sf2<-rain_meta_sf2[1:12]
+
+rain_xy<-st_coordinates(rain_meta_sf2)
+
+rain_meta_sf2$x<-rain_xy[,1]
+rain_meta_sf2$y<-rain_xy[,2]
+ 
+###Check it matches
+
+ ggplot()+geom_sf(data=rain_meta_sf, colour = "red",size=3)+  scale_fill_viridis_c(option = "magma")+geom_sf(data=river_net_Dolwen)+tidyterra::geom_spatraster(data = HAD_Dolwen_ppn_mean)+geom_sf(data= grid_1km,fill=NA)
+
+
+
+```
+
+## Scatter plot matrix for CMD
+
+```{r}
+##scatter plot matrix for relationships 
+p <- drop_na(point_1km_sf) |> ggpairs(columns = c(4,6,8,12,13,14))+ggpubr::theme_pubr()+theme(axis.text.x = element_text(angle = 90)) 
+ 
+p 
+```
+
+###Box plots of env. range and rain gauge location
+
+```{r}
+
+all_df_long<-drop_na(point_1km_sf[c(4,6,8,12,13,14,15)]) |>  st_drop_geometry() |> pivot_longer(cols = 1:6, names_to = "var", values_to = "value")
+
+site_df_long<-rain_meta_sf2[c(4,6,8,12,13,14,15)] |>  st_drop_geometry() |> pivot_longer(cols = 1:6, names_to = "var", values_to = "value")
+
+all_df_long |> ggplot() + geom_jitter(aes(x = var ,y = value),width=0.2,alpha=0.6, colour="gray")+facet_wrap(~var,scales="free") + geom_jitter(data = site_df_long,aes(x = var ,y = value),width=0.2,colour="red",size=1.7)+facet_wrap(~var,scales="free")+ggpubr::theme_pubr()+xlab("")+ylab("")+
+  theme(strip.text.x = element_blank())
+```
+
+### Set up grid
+
+This is messy and needs a function to be written...
+
+```{r}
+
+####create 6 x 6 design (NOTE can increase decrease the resolution here)
+
+###rescale all the variables
+
+point_1km_sf$mean_PPN_s<-scales::rescale(point_1km_sf$mean_PPN)
+point_1km_sf$x_s<-scales::rescale(point_1km_sf$x)
+point_1km_sf$y_s<-scales::rescale(point_1km_sf$y)
+point_1km_sf$elev_s<-scales::rescale(point_1km_sf$mean_elev)
+point_1km_sf$slope_s<-scales::rescale(point_1km_sf$mean_slope)
+
+## create the points
+a<-seq(min(point_1km_sf$x_s), max(point_1km_sf$x_s), length.out = 6)
+a2<-seq(min(point_1km_sf$y_s), max(point_1km_sf$y_s), length.out =6) 
+b<-seq(min(point_1km_sf$mean_PPN_s), max(point_1km_sf$mean_PPN_s), length.out = 6)
+c<-seq(min(point_1km_sf$elev_s), max(point_1km_sf$elev_s), length.out = 6)
+#d<-seq(min(point_1km_sf$slope_s), max(point_1km_sf$slope_s), length.out = 6)
+
+##expand them to a grid
+grid_x_ppn_s <- expand.grid(x = a, mean_PPN = b)
+grid_y_ppn_s <- expand.grid(y = a2, mean_PPN = b)
+grid_elev_ppn_s <- expand.grid(elev_s = c, mean_PPN_s = b)
+
+ 
+###Do the same for raw data
+
+a<-seq(min(point_1km_sf$x), max(point_1km_sf$x), length.out = 6)
+a2<-seq(min(point_1km_sf$y), max(point_1km_sf$y), length.out =6) 
+b<-seq(min(point_1km_sf$mean_PPN), max(point_1km_sf$mean_PPN), length.out = 6)
+c<-seq(min(point_1km_sf$mean_elev), max(point_1km_sf$mean_elev), length.out = 6)
+grid_x_ppn <- expand.grid(x = a, mean_PPN = b)
+grid_y_ppn <- expand.grid(y = a2, mean_PPN = b)
+grid_elev_ppn <- expand.grid(elev = c, mean_PPN = b)
+ 
+
+```
+
+##PPN and x cord
+
+```{r}
+#######--------------------------------x coord and PPN mm---------------------------- 
+
+
+### create df  
+poten <-tibble(x_s=point_1km_sf$x_s,mean_PPN_s =point_1km_sf$mean_PPN_s,site=rep("poten",times=length(point_1km_sf$x_s))) ## potential sites
+ 
+ideal<-tibble(x_s=grid_x_ppn_s$x,mean_PPN_s = grid_x_ppn_s$mean_PPN,site=rep("ideal",times=length(grid_x_ppn_s$x))) ##ideal sites
+ 
+
+df_combo<-rbind(poten,ideal)
+
+###calc distance matrix--------------------------
+
+distances <- dist(df_combo[c("x_s", "mean_PPN_s")], diag = TRUE, upper = TRUE)
+distances <- as.matrix(distances)
+
+distances <- distances[df_combo$site == "ideal",]
+distances <-as.matrix(distances) 
+
+distances <- distances[,1:nrow(poten)]
+
+####loop to find min--------------------------
+
+location<-rep(NA,times=nrow(ideal))
+
+for(i in 1:nrow(ideal)){ 
+location[i]<-which.min(distances[i,])
+}
+ 
+min_value<-rep(NA,times=nrow(ideal))
+for(i in 1:nrow(ideal)){ 
+min_value[i]<-min(distances[i,])
+}
+
+###set cutoff for distance and filter to remove sites above threshold
+
+df_selected<-tibble(location,min_value) |> filter(min_value<0.12)
+
+df_combo$selected<-rep(1:length(df_combo$x_s))
+point_1km_sf$selected<-rep(1:length(point_1km_sf$x_s))
+
+df_combo<-df_combo |> mutate(selected_x_ppn=case_when( selected %in% df_selected$location ~ "T",
+                                        .default = "NA"))
+
+point_1km_sf<-point_1km_sf |> mutate(selected_x_ppn=case_when( selected %in% df_selected$location ~ "T",
+                                        .default = "NA"))
+
+df_chosen<-df_combo |> filter(selected_x_ppn=="T")
+ 
+
+df_chosen_sf  <- point_1km_sf |>  filter(selected_x_ppn=="T") 
+
+
+##Plot in standardised units
+
+p1<-ggplot()+geom_point(data=point_1km_sf,aes(x_s,mean_PPN_s),colour="gray",size=2)+
+  geom_point(data=grid_x_ppn_s,aes(x,mean_PPN),color="red",shape=3)+ggpubr::theme_pubr()+ 
+  geom_point(data = df_chosen , aes(x_s,mean_PPN_s), shape = 21, size = 3) +
+  xlab("X Coordinate") +ylab("Annual P")
+  
+
+
+##in original units
+
+p2<-ggplot()+geom_point(data=point_1km_sf,aes(x,mean_PPN),colour="gray",size=2)+
+  geom_point(data=grid_x_ppn,aes(x,mean_PPN),color="red", shape=3)+ggpubr::theme_pubr()+ 
+  geom_point(data=rain_meta_sf2,aes(x,mean_PPN),colour="black",size=4)+
+  geom_point(data =df_chosen_sf  , aes(x,mean_PPN), shape = 21, size = 3) +
+  xlab("X Coordinate") +ylab("Annual P (mm)")
+
+
+```
+
+## y and PPN mm
+
+```{r}
+
+
+#######--------------------------------y and PPN mm---------------------------- 
+### create df  
+poten <-tibble(y_s=point_1km_sf$y_s,mean_PPN_s =point_1km_sf$mean_PPN_s,site=rep("poten",times=length(point_1km_sf$y_s)))
+ 
+ideal<-tibble(y_s=grid_y_ppn_s$y,mean_PPN_s = grid_y_ppn_s$mean_PPN,site=rep("ideal",times=length(grid_y_ppn_s$y)))
+ 
+
+df_combo<-rbind(poten,ideal)
+
+###calc distance matrix
+
+distances <- dist(df_combo[c("y_s", "mean_PPN_s")], diag = TRUE, upper = TRUE)
+distances <- as.matrix(distances)
+
+distances <- distances[df_combo$site == "ideal",]
+distances <-as.matrix(distances) 
+
+distances <- distances[,1:nrow(poten)]
+
+####loop to find min
+
+location<-rep(NA,times=nrow(ideal))
+
+for(i in 1:nrow(ideal)){ 
+location[i]<-which.min(distances[i,])
+}
+ 
+min_value<-rep(NA,times=nrow(ideal))
+for(i in 1:nrow(ideal)){ 
+min_value[i]<-min(distances[i,])
+}
+
+df_selected<-tibble(location,min_value) |> filter(min_value<0.12)
+
+df_combo$selected<-rep(1:length(df_combo$y_s))
+point_1km_sf$selected<-rep(1:length(point_1km_sf$y_s))
+
+df_combo<-df_combo |> mutate(selected_y_ppn=case_when( selected %in% df_selected$location ~ "T",
+                                        .default = "NA"))
+
+point_1km_sf<-point_1km_sf |> mutate(selected_y_ppn=case_when( selected %in% df_selected$location ~ "T",
+                                        .default = "NA"))
+
+df_chosen_y<-df_combo |> filter(selected_y_ppn=="T")
+ 
+
+df_chosen_sf_y  <- point_1km_sf |>  filter(selected_y_ppn=="T") 
+
+
+##Plot in standardised units
+
+p3<-ggplot()+geom_point(data=point_1km_sf,aes(y_s,mean_PPN_s),colour="gray",size=2)+
+  geom_point(data=grid_y_ppn_s,aes(y,mean_PPN),color="red",shape=3)+ggpubr::theme_pubr()+ 
+  geom_point(data = df_chosen_y , aes(y_s,mean_PPN_s), shape = 21, size = 3) +
+  xlab("Y Coordinate") +ylab("Annual P")
+  
+
+
+##in original units
+
+p4<-ggplot()+geom_point(data=point_1km_sf,aes(y,mean_PPN),colour="gray",size=2)+
+  geom_point(data=grid_y_ppn,aes(y,mean_PPN),color="red", shape=3)+ggpubr::theme_pubr()+ 
+  geom_point(data=rain_meta_sf2,aes(y,mean_PPN),colour="black",size=4)+
+  geom_point(data =df_chosen_sf_y  , aes(y,mean_PPN), shape = 21, size = 3) +
+  xlab("Y Coordinate") +ylab("Annual P (mm)")
+
+
+
+```
+
+## elev and PPN mm
+
+```{r}
+#######--------------------------------elev and PPN mm---------------------------- 
+### create df  
+poten <-tibble(elev_s=point_1km_sf$elev_s,mean_PPN_s =point_1km_sf$mean_PPN_s,site=rep("poten",times=length(point_1km_sf$y_s)))
+ 
+ideal<-tibble(elev_s=grid_elev_ppn_s$elev_s,mean_PPN_s = grid_elev_ppn_s$mean_PPN,site=rep("ideal",times=length(grid_y_ppn_s$y)))
+ 
+
+df_combo<-rbind(poten,ideal)
+
+###calc distance matrix
+
+distances <- dist(df_combo[c("elev_s", "mean_PPN_s")], diag = TRUE, upper = TRUE)
+distances <- as.matrix(distances)
+
+distances <- distances[df_combo$site == "ideal",]
+distances <-as.matrix(distances) 
+
+distances <- distances[,1:nrow(poten)]
+
+####loop to find min
+
+location<-rep(NA,times=nrow(ideal))
+
+for(i in 1:nrow(ideal)){ 
+location[i]<-which.min(distances[i,])
+}
+ 
+min_value<-rep(NA,times=nrow(ideal))
+for(i in 1:nrow(ideal)){ 
+min_value[i]<-min(distances[i,])
+}
+
+df_selected<-tibble(location,min_value) |> filter(min_value<0.12)
+
+df_combo$selected<-rep(1:length(df_combo$elev_s))
+point_1km_sf$selected<-rep(1:length(point_1km_sf$elev_s))
+
+df_combo<-df_combo |> mutate(selected_elev_ppn=case_when( selected %in% df_selected$location ~ "T",
+                                        .default = "NA"))
+
+point_1km_sf<-point_1km_sf |> mutate(selected_elve_ppn=case_when( selected %in% df_selected$location ~ "T",
+                                        .default = "NA"))
+
+df_chosen_elev<-df_combo |> filter(selected_elev_ppn=="T")
+ 
+
+df_chosen_sf_elev  <- point_1km_sf |>  filter(selected_elve_ppn=="T") 
+
+
+##Plot in standardised units
+
+p5<-ggplot()+geom_point(data=point_1km_sf,aes(elev_s,mean_PPN_s),colour="gray",size=2)+
+  geom_point(data=grid_elev_ppn_s,aes(elev_s,mean_PPN_s),color="red",shape=3)+ggpubr::theme_pubr()+ 
+  geom_point(data = df_chosen_elev , aes(elev_s,mean_PPN_s), shape = 21, size = 3) +
+  xlab("Elevation") +ylab("Annual P")
+  
+
+
+##in original units
+
+p6<-ggplot()+geom_point(data=point_1km_sf,aes(mean_elev,mean_PPN),colour="gray",size=2)+
+  geom_point(data=grid_elev_ppn,aes(elev,mean_PPN),color="red", shape=3)+ggpubr::theme_pubr()+ 
+  geom_point(data=rain_meta_sf2,aes(mean_elev,mean_PPN),colour="black",size=4)+
+  geom_point(data =df_chosen_sf_elev  , aes(mean_elev,mean_PPN), shape = 21, size = 3) +
+  xlab("Elevation (m)") +ylab("Annual P (mm)")
+
+
+
+
+
+
+
+
+
+```
+
+## Combined plots
+
+```{r}
+cowplot::plot_grid(p2,p4,p6)
+```
+
+## Maps of site optimization
+
+```{r}
+
+
+ ggplot()+geom_sf(data= grid_1km_sf,aes(fill = mean_PPN))+geom_sf(data=rain_meta_sf, colour = "red",size=3)+ scale_fill_grass_c(palette = "blues") +theme_light() +xlab("")+ylab("") +
+    annotation_scale(
+    height = unit(0.015, "npc"),
+    width_hint = 0.5,
+    pad_x = unit(0.07, "npc"),
+    pad_y = unit(0.03, "npc"),
+    text_cex = .8
+  ) +
+  annotation_north_arrow(
+    which_north = TRUE,
+    pad_x = unit(0.84, "npc"),
+    pad_y = unit(0.83, "npc"),
+    style = north_arrow_fancy_orienteering()
+  ) +theme(plot.margin = unit(c(0,0,0,0), "cm")) +labs(fill="Ann. P (mm)") + geom_sf(data=df_chosen_sf_elev,size=3) + geom_sf(data=df_chosen_sf_y, size = 3, shape = 3)+ geom_sf(data=df_chosen_sf, size = 3, shape = 7)
+
+```
