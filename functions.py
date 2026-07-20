@@ -411,7 +411,7 @@ def plot_and_check(rainfall_gdf_merged, solution,cell_centroids, catchment_Dolwe
 
     # --------------------------------------------------            
     catchment_Dolwen.boundary.plot(ax=ax, color="black")     
-    rainfall_gdf_merged.plot(column="cluster",categorical=True,legend=True,ax=ax,alpha=1 , cmap='Set3')
+    rainfall_gdf_merged.plot(column="cluster",categorical=True,legend=True,ax=ax,alpha=1 , cmap='Set1')
     rainfall_gdf_merged.boundary.plot(ax=ax, color="black", linewidth=1) # Grid outlines        
         
     # --------------------------------------------------
