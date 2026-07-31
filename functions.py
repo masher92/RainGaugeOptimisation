@@ -6,18 +6,13 @@ import copy
 import math
 import matplotlib.pyplot as plt
 import geopandas as gpd
-
-def prepare_coordinates(cell_centroids, existing_coords):
-    """
-    Convert everything into consistent numpy arrays in projected CRS units.
-    """
-
-    cell_coords = np.vstack([np.array([geom.x, geom.y]) 
-        for geom in cell_centroids.geometry])
-
-    existing_coords = np.asarray(existing_coords)
-
-    return cell_coords, existing_coords
+import rasterio
+from scipy.spatial import cKDTree
+from pyproj import Transformer
+from affine import Affine
+from rasterio.features import geometry_mask
+import rasterio
+from rasterio.mask import mask
 
 # --------------------------------------------------
 # STRICT FEASIBILITY CHECK (single source of truth)
@@ -44,408 +39,279 @@ def is_feasible(candidate_xy, selected_idx, cell_coords, existing_coords, min_di
 
     return True
 
-
-# --------------------------------------------------
-# GREEDY SELECTION (constraint-safe, no fallback hacks)
-# --------------------------------------------------
-def greedy_selection(cluster_candidates, cell_coords, existing_coords, min_dist):
-
-    selected = {}         # cluster_id -> chosen cell index
-    selected_idx = []    # list of chosen indices
-
-    failed_clusters = {}
-
-    for cluster_id, candidates in cluster_candidates.items():
-
-        chosen = None
-
-        for idx in candidates:
-
-            candidate_xy = cell_coords[idx]
-
-            if is_feasible(candidate_xy, selected_idx, cell_coords, existing_coords, min_dist):
-                chosen = idx
-                selected_idx.append(idx)
-                break
-
-        if chosen is not None:
-            selected[cluster_id] = chosen
-        else:
-            failed_clusters[cluster_id] = "no_feasible_candidate"
-
-    return selected, failed_clusters
-
-# def run_greedy(cluster_candidates, cell_centroids,  existing_coords, min_dist):
-
-#     # --- enforce consistent coordinate system ---
-#     cell_coords, existing_coords = prepare_coordinates(cell_centroids, existing_coords)
-
-#     solution = greedy_selection(cluster_candidates, cell_coords, existing_coords, min_dist)
-
-#     return solution
-
-# --------------------------------------------------
-# SHUFFLE + GREEDY WRAPPER
-# --------------------------------------------------
-def shuffle_greedy(cluster_candidates, cell_coords, existing_coords, min_dist, n_iterations=500):
-
-    best_solution = None
-    best_score = (-1, float("inf"))
-
-    cluster_keys = list(cluster_candidates.keys())
-
-    for _ in range(n_iterations):
-
-        # shuffle order of cluster processing
-        shuffled_keys = cluster_keys.copy()
-        random.shuffle(shuffled_keys)
-
-        shuffled_candidates = {c: cluster_candidates[c] for c in shuffled_keys}
-
-        # run greedy
-        solution, failed = greedy_selection(shuffled_candidates,cell_coords,existing_coords,min_dist)
-
-        # score MUST use full cluster set (not shuffled subset)
-        s = score(solution, cluster_candidates)
-
-        if s > best_score:
-            best_score = s
-            best_solution = solution
-
-    return best_solution
-
-def check_solution(solution,cell_coords,existing_coords,min_dist):
-
-    selected_idx = list(solution.values())
-    selected_coords = cell_coords[selected_idx]
-
-    # --- check selected vs selected ---
-    if len(selected_coords) > 1:
-        d_sel = cdist(selected_coords, selected_coords)
-        np.fill_diagonal(d_sel, np.inf)
-        print("Min selected-selected distance:", d_sel.min())
-
-    # --- check selected vs existing ---
-    if len(existing_coords) > 0:
-        d_exist = cdist(selected_coords, existing_coords)
-        min_d = d_exist.min()
-
-        print("Min selected-existing distance:", min_d)
-
-        violations = np.where(d_exist < min_dist)
-
-        if len(violations[0]) > 0:
-            print("🚨 Violations found:")
-            for i, j in zip(*violations):
-                print(f"  selected {selected_idx[i]} too close to existing {j}")
-                
-
-# ── Shared scoring function ──────────────────────────────────────────────────
-def evaluate_solution(selected_cells, cluster_candidates, cell_coords, existing_coords, min_dist):
-    """
-    Returns a dict of diagnostics for a given solution.
-    """
-    results = {}
+def find_backup_30m_locations(selected_df, zone_raster, combined_mask, labels_30m_full, dem_arr, slope_arr, valid_mask_30m,
+                              existing_coords, transform, diagnostics, min_dist, zone_id, n_new, plot=False):
     
-    # 1. Coverage: how many clusters got a gauge
-    results["n_covered"] = len(selected_cells)
-    results["n_clusters"] = len(cluster_candidates)
-    results["coverage_pct"] = 100 * len(selected_cells) / len(cluster_candidates)
-    
-    # 2. Candidate quality: average rank of chosen candidates
-    #    (0 = top candidate chosen, higher = had to fall back)
-#     ranks = []
-#     for c, sel in zip(cluster_candidates.keys(), selected_cells):
-#         candidates = list(cluster_candidates[c])
-#         if sel in candidates:
-#             ranks.append(candidates.index(sel))
-#         else:
-#             ranks.append(np.nan)
+    # print(zone_id)
+    n_alternatives = 5
 
-    ranks = []
-    for c, sel in selected_cells.items():
-        candidates = list(cluster_candidates[c])
-        if sel in candidates:
-            ranks.append(candidates.index(sel))
-        else:
-            ranks.append(np.nan)
+    cell = selected_df[selected_df["zone_id"] == zone_id].iloc[0]
+    rr = cell["row"]
+    cc = cell["col"]
+    new_gauge_num = cell["new_gauge_num"]
 
-    results["mean_candidate_rank"] = np.nanmean(ranks)
-    results["max_candidate_rank"]  = np.nanmax(ranks)
-    results["rank_details"] = dict(zip(cluster_candidates.keys(), ranks))
-    
-    # 3. Spacing: min distance between any two selected gauges
-    selected_indices = list(selected_cells.values())
-    
-    
-    if len(selected_indices) > 1:
-        coords = cell_coords[selected_indices]
-        dm = cdist(coords, coords)
-        np.fill_diagonal(dm, np.inf)
-        results["min_spacing_selected"] = dm.min()
-        results["any_spacing_violation"] = bool((dm < min_dist).any())
+    mask = (zone_raster == zone_id) & combined_mask
+    rows, cols = np.where(mask)
+
+    rmin, rmax = rows.min(), rows.max()
+    cmin, cmax = cols.min(), cols.max()
+
+    rr_local = rr - rmin
+    cc_local = cc - cmin
+
+    subset_clusters = labels_30m_full[rmin:rmax+1, cmin:cmax+1]
+    subset_dem = dem_arr[rmin:rmax+1, cmin:cmax+1]
+    subset_slope = slope_arr[rmin:rmax+1, cmin:cmax+1]
+    subset_mask = mask[rmin:rmax+1, cmin:cmax+1]
+
+    clusters_plot = np.ma.masked_where(~subset_mask, subset_clusters)
+    dem_plot = np.ma.masked_where(~subset_mask, subset_dem)
+    slope_plot = np.ma.masked_where(~subset_mask, subset_slope)
+
+    dem_vmin = np.nanmin(dem_arr[valid_mask_30m])
+    dem_vmax = np.nanmax(dem_arr[valid_mask_30m])
+    slope_vmin = np.nanmin(slope_arr[valid_mask_30m])
+    slope_vmax = np.nanmax(slope_arr[valid_mask_30m])
+
+    # --- Distance to nearest gauge ---
+    other_gauge_coords = np.array(
+        existing_coords.tolist() if hasattr(existing_coords, "tolist") else list(existing_coords))
+    other_new_gauges = selected_df[selected_df["zone_id"] != zone_id][["x", "y"]].values
+
+    if len(other_new_gauges):
+        all_gauge_coords = np.vstack([other_gauge_coords, other_new_gauges])
     else:
-        results["min_spacing_selected"] = np.nan
-        results["any_spacing_violation"] = False
-    
-    # 4. Spacing vs existing gauges
-    violations = []
-    for i, idx in enumerate(selected_indices):
-        pt = cell_coords[idx]
+        all_gauge_coords = other_gauge_coords
 
-        for ex in existing_coords:
-            dist = np.linalg.norm(pt - ex)
-            if dist < min_dist:
-                violations.append((i, dist))    
-    
-    results["existing_gauge_violations"] = violations
-    results["any_existing_violation"] = len(violations) > 0
-    
-    return results
+    local_rows, local_cols = np.where(subset_mask)
+    global_rows = local_rows + rmin
+    global_cols = local_cols + cmin
 
+    xs, ys = rasterio.transform.xy(transform, global_rows, global_cols)
+    xs, ys = np.array(xs), np.array(ys)
 
-def print_evaluation(label, results, runtime, min_dist):
-    print(f"\n{'='*50}")
-    print(f"  {label}")
-    print(f"{'='*50}")
-    print(f"  Coverage:          {results['n_covered']}/{results['n_clusters']} "
-          f"({results['coverage_pct']:.1f}%)")
-    print(f"  Mean rank chosen:  {results['mean_candidate_rank']:.2f}  "
-          f"(0 = always top candidate)")
-    print(f"  Max rank chosen:   {results['max_candidate_rank']:.0f}")
-    print(f"  Min gauge spacing: {results['min_spacing_selected']:.0f} m  "
-          f"(threshold: {min_dist} m)")
-    print(f"  Spacing violation: {results['any_spacing_violation']}")
-    print(f"  Existing violation:{results['any_existing_violation']}")
-    print(f"  Runtime:           {runtime:.2f}s")
-    if results['any_spacing_violation'] or results['any_existing_violation']:
-        print("  ⚠️  INVALID SOLUTION — constraint violated")
-    else:
-        print("  ✅ Valid solution")
-    # Show which clusters had to fall back from top candidate
-    fallbacks = {c: r for c, r in results['rank_details'].items() if r > 0}
-    if fallbacks:
-        print(f"  Clusters using fallback candidates: {fallbacks}")
+    pixel_coords = np.column_stack([xs, ys])
 
+    dists = np.sqrt(
+        ((pixel_coords[:, None, 0] - all_gauge_coords[None, :, 0]) ** 2) +
+        ((pixel_coords[:, None, 1] - all_gauge_coords[None, :, 1]) ** 2))
 
+    min_dist_to_gauge = dists.min(axis=1)
 
-def score(solution, cluster_candidates):
-    n_covered = len(solution)
-    
-    rank_sum = sum(list(cluster_candidates[c]).index(cell)
-        for c, cell in solution.items()
-        if c in cluster_candidates)
-    
-    return (n_covered, -rank_sum)
+    dist_full = np.full(subset_mask.shape, np.nan)
+    dist_full[local_rows, local_cols] = min_dist_to_gauge
+    dist_plot = np.ma.masked_where(~subset_mask, dist_full)
 
-def get_neighbour(solution, cluster_candidates, cell_coords, existing_coords, min_dist):
+    # --- Ranked candidates function ---
+    def get_ranked_feasible_alternatives(zone_id, diagnostics, transform, all_gauge_coords,
+                                         min_dist, n_alternatives=5):
 
-    new_solution = copy.deepcopy(solution)
+        ranked = diagnostics[zone_id]["candidates_ranked"].copy()
 
-    # pick random cluster
-    cluster_id = random.choice(list(cluster_candidates.keys()))
-    candidates = cluster_candidates[cluster_id]
+        xs, ys = rasterio.transform.xy(transform, ranked["row"].values, ranked["col"].values)
+        ranked["x"] = xs
+        ranked["y"] = ys
 
-    current = new_solution.get(cluster_id, None)
-
-    # try alternative candidates
-    for idx in candidates:
-
-        if idx == current:
-            continue
-
-        candidate_xy = cell_coords[idx]
-
-        # --- check against existing ---
-        if len(existing_coords) > 0:
-            if np.any(np.linalg.norm(existing_coords - candidate_xy, axis=1) < min_dist):
-                continue
-
-        # --- check against current solution ---
-        ok = True
-        for c, sel_idx in new_solution.items():
-            if c == cluster_id:
-                continue
-            if np.linalg.norm(cell_coords[sel_idx] - candidate_xy) < min_dist:
-                ok = False
-                break
-
-        if ok:
-            new_solution[cluster_id] = idx
-            return new_solution
-
-    return solution
-
-def simulated_annealing(initial_solution, cluster_candidates, cell_coords, existing_coords, min_dist,
-                        T0=1.0, Tmin=0.001, alpha=0.995, n_iter=5000):
-    current = dict(initial_solution)
-    current_score = score(current, cluster_candidates)
-    best = dict(current)
-    best_score = current_score
-    T = T0
-
-    for _ in range(n_iter):
-        neighbour = get_neighbour(current, cluster_candidates, cell_coords, existing_coords, min_dist)
-        neighbour_score = score(neighbour, cluster_candidates)
-
-        # --- accept rule ---
-        # coverage always dominates: only use probabilistic acceptance when coverage is equal
-        if neighbour_score[0] > current_score[0]:
-            # strictly more clusters covered -> always accept
-            accept = True
-
-        elif neighbour_score[0] == current_score[0]:
-            # same coverage -> use rank component for SA accept rule
-            delta = neighbour_score[1] - current_score[1]
-            accept = delta > 0 or random.random() < math.exp(delta / T)
-
+        if len(all_gauge_coords):
+            dist_matrix = np.sqrt(
+                ((ranked["x"].values[:, None] - all_gauge_coords[None, :, 0]) ** 2) +
+                ((ranked["y"].values[:, None] - all_gauge_coords[None, :, 1]) ** 2)
+            )
+            ranked["dist_to_nearest_gauge"] = dist_matrix.min(axis=1)
         else:
-            # fewer clusters covered -> never accept (coverage is sacred)
-            accept = False
+            ranked["dist_to_nearest_gauge"] = np.inf
 
-        if accept:
-            current = neighbour
-            current_score = neighbour_score
-            if current_score > best_score:
-                best = dict(current)
-                best_score = current_score
+        ranked["feasible"] = ranked["dist_to_nearest_gauge"] >= min_dist
 
-        T *= alpha
-        if T < Tmin:
-            break
+        result = ranked[ranked["feasible"]].head(n_alternatives).reset_index(drop=True)
+        result["rank"] = range(1, len(result) + 1)
+        return result
 
-    return best
+    ranked = get_ranked_feasible_alternatives(
+        zone_id, diagnostics, transform, all_gauge_coords, min_dist, n_alternatives)
+    ranked['new_gauge_num'] = new_gauge_num
 
-def ilp_solution(cluster_candidates,cell_coords,existing_coords,min_dist):
+    ranked["row_local"] = ranked["row"] - rmin
+    ranked["col_local"] = ranked["col"] - cmin
 
-    prob = LpProblem("gauge_placement", LpMinimize)
+    # --- Figure with 5 panels ---
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes=axes.flatten()
 
-    # --------------------------------------------------
-    # Decision variables
-    # --------------------------------------------------
-    x = {}
+    panels = [
+        (axes[0], clusters_plot, "tab10", None, None, f"30m clusters — cell {zone_id}"),
+        (axes[1], dem_plot, "terrain", dem_vmin, dem_vmax, f"Elevation (m) — cell {zone_id}"),
+        (axes[2], slope_plot, "viridis", slope_vmin, slope_vmax, f"Slope (°) — cell {zone_id}"),
+        (axes[3], dist_plot, "RdYlGn", None, None, f"Distance to nearest gauge (m)"),]
 
-    for c, candidates in cluster_candidates.items():
-        for rank, idx in enumerate(candidates):
-            x[(c, idx)] = LpVariable(f"x_{c}_{idx}", cat="Binary")
+    # --- Local panels ---
+    for ax, data, cmap, vmin, vmax, title in panels:
+        im = ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.set_title(title)
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    # --------------------------------------------------
-    # Objective: minimise rank penalty
-    # --------------------------------------------------
-    prob += lpSum(rank * x[(c, idx)]
-        for c, candidates in cluster_candidates.items()
-        for rank, idx in enumerate(candidates))
+        for _, r in ranked.iterrows():
+            if r["rank"] == 1:
+                ax.scatter(r["col_local"], r["row_local"],
+                           c="red", edgecolors="black",
+                           s=180, marker="*", zorder=6)
+            else:
+                ax.text(
+                    r["col_local"], r["row_local"], str(int(r["rank"])),
+                    ha="center", va="center",
+                    fontsize=9, fontweight="bold",
+                    bbox=dict(boxstyle="circle,pad=0.25",
+                              fc="white", ec="black", lw=0.8),
+                    zorder=5,
+                )
 
-    # --------------------------------------------------
-    # Constraint 1: one per cluster
-    # --------------------------------------------------
-    for c, candidates in cluster_candidates.items():
-        prob += lpSum(x[(c, idx)] for idx in candidates) == 1
+    # --- Distance contour ---
+    cs = axes[3].contour(dist_plot, levels=[min_dist], colors="black", linewidths=1.5)
+    axes[3].clabel(cs, fmt=f"{min_dist:.0f} m")
 
-    # --------------------------------------------------
-    # Precompute all candidate coords
-    # --------------------------------------------------
-    coords = {
-        idx: cell_coords[idx]
-        for c in cluster_candidates
-        for idx in cluster_candidates[c]}
+    # ==========================================================
+    # 🌍 FULL CATCHMENT PANEL
+    # ==========================================================
+    ax_full = axes[4]
 
-    # --------------------------------------------------
-    # Constraint 2: min distance between ALL selected points
-    # --------------------------------------------------
-    all_items = [(c, idx) for c, candidates in cluster_candidates.items()
-                         for idx in candidates]
+    # Compute extent from transform
+    nrows, ncols = dem_arr.shape
+    x0, y0 = rasterio.transform.xy(transform, 0, 0)
+    x1, y1 = rasterio.transform.xy(transform, nrows-1, ncols-1)
 
-    for i in range(len(all_items)):
-        c1, idx1 = all_items[i]
+    extent = [x0, x1, y1, y0]
 
-        for j in range(i + 1, len(all_items)):
-            c2, idx2 = all_items[j]
+    im_full = ax_full.imshow( np.ma.masked_where(~valid_mask_30m, dem_arr), cmap="terrain", vmin=dem_vmin, vmax=dem_vmax,
+                             extent=extent)
 
-            # skip same cluster pairs (already handled)
-            if c1 == c2:
-                continue
+    ax_full.set_title("Gauge location (full catchment)")
+    ax_full.axis("off")
 
-            if np.linalg.norm(coords[idx1] - coords[idx2]) < min_dist:
-                prob += x[(c1, idx1)] + x[(c2, idx2)] <= 1
+    # Highlight current zone
+    zone_outline = np.zeros_like(zone_raster, dtype=float)
+    zone_outline[zone_raster == zone_id] = 1
 
-    # --------------------------------------------------
-    # Constraint 3: min distance between ALL selected points
-    # --------------------------------------------------                
-    for c, candidates in cluster_candidates.items():
-        for idx in candidates:
+    # ax_full.contour(zone_outline, levels=[0.5], colors="red", linewidths=1.5, extent=extent)
 
-            candidate_xy = cell_coords[idx]
+    # Existing gauges
+    if len(existing_coords):
+        ax_full.scatter(existing_coords[:, 0], existing_coords[:, 1],
+                        c="black", s=20, label="Existing", zorder=3)
 
-            for j, ex in enumerate(existing_coords):
+    # All new gauges
+    all_selected = selected_df[["x", "y"]].values
+    if len(all_selected):
+        ax_full.scatter(all_selected[:, 0], all_selected[:, 1],
+                        c="blue", s=30, label="New", zorder=4)
 
-                if np.linalg.norm(candidate_xy - ex) < min_dist:
+    # Current zone candidates
+    for _, r in ranked.iterrows():
+        if r["rank"] == 1:
+            ax_full.scatter(r["x"], r["y"],
+                            c="red", edgecolors="black",
+                            s=120, marker="*", zorder=6)
+        else:
+            ax_full.text( r["x"], r["y"], str(int(r["rank"])), ha="center", va="center", fontsize=8, fontweight="bold", 
+                         bbox=dict(boxstyle="circle,pad=0.2", fc="white", ec="black"), zorder=5)
 
-                    # forbid this candidate entirely
-                    prob += x[(c, idx)] == 0                
+    ax_full.legend(loc="lower left")
+    fig.colorbar(im_full, ax=ax_full, fraction=0.046, pad=0.04)
+
+    n_used = 5
+    for i in range(n_used, len(axes)):
+        axes[i].axis('off')
+    plt.tight_layout()
+
+    fig.savefig(f'Outputs/{n_new}Gauges/Gauge_{new_gauge_num}_Alternatives.png')
+
+    if plot == True:
+        plt.show()
+    else:
+        plt.close(fig)   # prevents inline auto-display when plot=False
+
+    return ranked
 
 
-    # --------------------------------------------------
-    # Solve
-    # --------------------------------------------------
-    prob.solve(pulp.PULP_CMD(msg=0))  # default fallback)
 
-    print("ILP status:", LpStatus[prob.status])
+def get_grid_data(obj, y_coord='projection_y_coordinate', x_coord='projection_x_coordinate'):
+    """Return (data2d, x1d, y1d) from an iris Cube or xarray DataArray."""
+    if hasattr(obj, 'coord'):  # iris cube
+        y1d = obj.coord(y_coord).points
+        x1d = obj.coord(x_coord).points
+        data = obj.data
+        data2d = data.filled(np.nan) if np.ma.is_masked(data) else np.asarray(data)
+    else:  # xarray DataArray
+        # handle either rioxarray's default 'x'/'y' or named projection coords
+        y_name = y_coord if y_coord in obj.coords else 'y'
+        x_name = x_coord if x_coord in obj.coords else 'x'
+        y1d = obj[y_name].values
+        x1d = obj[x_name].values
+        data2d = obj.values
+    return np.asarray(data2d, dtype=float), x1d, y1d
 
-    # --------------------------------------------------
-    # Extract solution
-    # --------------------------------------------------
-    solution = {}
 
-    for c, candidates in cluster_candidates.items():
-        for idx in candidates:
-            if value(x[(c, idx)]) == 1:
-                solution[c] = idx
+def sample_at_points(data2d, x1d, y1d, gdf, crs="EPSG:27700"):
+    """Nearest-neighbour sample of a 2D grid at point locations, skipping NaN cells
+    so a gauge near the catchment edge doesn't snap to a masked-out cell."""
+    gdf = gdf.to_crs(crs)
+    xx, yy = np.meshgrid(x1d, y1d)
+    grid_points = np.column_stack([xx.ravel(), yy.ravel()])
+    flat_data = data2d.ravel()
+    valid = ~np.isnan(flat_data)
+    tree = cKDTree(grid_points[valid])
+    values = np.array([flat_data[valid][tree.query([geom.x, geom.y])[1]]
+                        for geom in gdf.geometry])
+    return values
 
-    return solution
 
-def plot_and_check(rainfall_gdf_merged, solution,cell_centroids, catchment_Dolwen, existing_coords,min_dist,title, ax=None):
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 8))
-
-    # --------------------------------------------------            
-    catchment_Dolwen.boundary.plot(ax=ax, color="black")     
-    rainfall_gdf_merged.plot(column="cluster",categorical=True,legend=True,ax=ax,alpha=1 , cmap='Set1')
-    rainfall_gdf_merged.boundary.plot(ax=ax, color="black", linewidth=1) # Grid outlines        
-        
-    # --------------------------------------------------
-    # Extract selected points
-    # --------------------------------------------------
-    selected_idx = list(solution.values())
-
-    selected_coords = np.vstack([np.array([cell_centroids[i].x, cell_centroids[i].y])
-        for i in selected_idx])
+def plot_spatial(ax, data2d, x1d, y1d, catchment_gdf, gauges_existing=None, gauges_new=None,
+                 title='', units='', cmap='Blues'):
     
-    existing_coords = np.asarray(existing_coords)
+    im = ax.pcolormesh(x1d, y1d, data2d, cmap=cmap, shading='auto')
+    
+    catchment_gdf.to_crs("EPSG:27700").boundary.plot(ax=ax, color='black', linewidth=1.2)
 
-    # --------------------------------------------------
-    # Plot base data (optional but useful)
-    # --------------------------------------------------
-    ax.scatter(existing_coords[:, 0], existing_coords[:, 1], c="red", marker = "X", label="Existing gauges", s=60)
-    ax.scatter(selected_coords[:, 0], selected_coords[:, 1], c="black", label="Selected new gauges", s=40)
+    if gauges_existing is not None:
+        g = gauges_existing.to_crs("EPSG:27700")
+        ax.scatter(g.geometry.x, g.geometry.y, marker='o', s=70,
+                   facecolor='white', edgecolor='black',
+                   linewidth=1.2, label='Existing gauges', zorder=5)
 
-    # --------------------------------------------------
-    # Draw buffer circles (true constraint radius)
-    # --------------------------------------------------
-    for x, y in selected_coords:
-        circle = plt.Circle((x, y), min_dist, fill=False, linestyle="--", color="red", alpha=1)
-        ax.add_patch(circle)
+    if gauges_new is not None:
+        g = gauges_new.to_crs("EPSG:27700")
+        ax.scatter(g.geometry.x, g.geometry.y, marker='*', s=150,
+                   facecolor='red', edgecolor='black',
+                   linewidth=0.8, label='Proposed gauges', zorder=5)
 
-    # --------------------------------------------------
-    # Final plot formatting
-    # --------------------------------------------------
+    ax.set_aspect('equal')
     ax.set_title(title)
-    #ax.legend()
-    ax.set_aspect("equal")
+    ax.legend(loc='upper right', fontsize=8)
 
-    # plt.show()
-    
+    # ✅ FIX HERE
+    ax.figure.colorbar(im, ax=ax, shrink=0.8, label=units)
+
+    ax.axis("off")
+
+
+def plot_histogram(ax, data2d, existing_values=None, new_values=None, title='', xlabel=''):
+    flat = data2d[~np.isnan(data2d)]
+    ax.hist(flat, bins=30, color='steelblue', edgecolor='white', alpha=0.8, label='Catchment cells')
+
+    if existing_values is not None:
+        for i, v in enumerate(existing_values):
+            ax.axvline(v, color='black', linestyle='--', linewidth=1.5,
+                       label='Existing gauges' if i == 0 else None)
+    if new_values is not None:
+        for i, v in enumerate(new_values):
+            ax.axvline(v, color='red', linestyle=':', linewidth=1.5,
+                       label='Proposed gauges' if i == 0 else None)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel('Number of grid cells')
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+
 def trim_to_bbox_of_region_obs(obs_cube, gdf, y_coord, x_coord, buffer_km=0):
 
     import numpy as np
@@ -480,20 +346,12 @@ def trim_to_bbox_of_region_obs(obs_cube, gdf, y_coord, x_coord, buffer_km=0):
     buffer_deg = buffer_km / 111.0
 
     minx, miny, maxx, maxy = bbox
-    bbox = (
-        minx - buffer_deg,
-        miny - buffer_deg,
-        maxx + buffer_deg,
-        maxy + buffer_deg
-    )
+    bbox = (minx - buffer_deg, miny - buffer_deg, maxx + buffer_deg, maxy + buffer_deg)
 
     # ---------------------------
     # mask grid
     # ---------------------------
-    inregion = (
-        (lons_2d > bbox[0]) & (lons_2d < bbox[2]) &
-        (lats_2d > bbox[1]) & (lats_2d < bbox[3])
-    )
+    inregion = ((lons_2d > bbox[0]) & (lons_2d < bbox[2]) & (lats_2d > bbox[1]) & (lats_2d < bbox[3]))
 
     region_inds = np.where(inregion)
 
@@ -502,4 +360,60 @@ def trim_to_bbox_of_region_obs(obs_cube, gdf, y_coord, x_coord, buffer_km=0):
 
     obs_cube = obs_cube[..., imin:imax+1, jmin:jmax+1]
 
+    return obs_cube   
+
+def mask_to_catchment(obs_cube, gdf, y_coord='projection_y_coordinate', x_coord='projection_x_coordinate'):
+    """
+    Mask cells outside the catchment polygon boundary (not just its bbox).
+    Assumes obs_cube coords are in the same CRS as EPSG:27700 (BNG),
+    which is standard for CEH-GEAR.
+    """
+    # Reproject catchment to the grid's native CRS (BNG) - cheap, few vertices
+    gdf_bng = gdf.to_crs("EPSG:27700")
+    geoms = gdf_bng.geometry.values
+
+    y = obs_cube.coord(y_coord).points
+    x = obs_cube.coord(x_coord).points
+
+    dx = x[1] - x[0]
+    dy = y[1] - y[0]  # note: often negative if y runs north->south
+
+    # Affine transform mapping (col, row) -> (x, y), pixel corners at cell edges
+    transform = Affine.translation(x[0] - dx / 2, y[0] - dy / 2) * Affine.scale(dx, dy)
+
+    ny, nx = len(y), len(x)
+
+    # geometry_mask default: True = outside the shapes (i.e. cells to mask out)
+    outside_mask = geometry_mask(geoms, out_shape=(ny, nx), transform=transform, invert=False)
+
+    # Broadcast the 2D mask across any leading (e.g. time) dimensions
+    full_mask = np.broadcast_to(outside_mask, obs_cube.shape)
+
+    masked_data = np.ma.masked_array(obs_cube.data, mask=full_mask.copy())  # .copy() to make writeable
+    obs_cube.data = masked_data
     return obs_cube
+
+def sample_landcover_at_gauges(clipped, transform, gdf, raster_crs, class_col_name='landcover_class'):
+    """
+    Sample a clipped landcover raster at gauge point locations.
+    gdf: GeoDataFrame of gauge points (any CRS - will be reprojected to match raster)
+    clipped: 2D array from rasterio.mask.mask (already band-indexed, e.g. clipped[0])
+    transform: the affine transform returned alongside `clipped`
+    """
+    gdf = gdf.to_crs(raster_crs)
+    coords = [(geom.x, geom.y) for geom in gdf.geometry]
+
+    # rasterio doesn't have a direct "sample an array" method - convert
+    # coords to row/col via the transform ourselves (fast, exact)
+    rows, cols = rasterio.transform.rowcol(transform, [c[0] for c in coords], [c[1] for c in coords])
+
+    values = []
+    for r, c in zip(rows, cols):
+        if 0 <= r < clipped.shape[0] and 0 <= c < clipped.shape[1]:
+            values.append(clipped[r, c])
+        else:
+            values.append(np.nan)  # gauge falls outside the clipped raster extent
+
+    gdf = gdf.copy()
+    gdf[class_col_name] = values
+    return gdf
