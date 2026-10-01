@@ -362,6 +362,41 @@ def trim_to_bbox_of_region_obs(obs_cube, gdf, y_coord, x_coord, buffer_km=0):
 
     return obs_cube   
 
+def trim_to_bbox_of_region_obs_new(obs_cube, gdf, y_coord, x_coord, buffer_km=0):
+
+    # Grid coordinates in BNG
+    x = obs_cube.coord(x_coord).points
+    y = obs_cube.coord(y_coord).points
+
+    # Catchment bounds in BNG
+    gdf = gdf.to_crs("EPSG:27700")
+    minx, miny, maxx, maxy = gdf.total_bounds
+
+    # Buffer in metres
+    buffer_m = buffer_km * 1000
+
+    minx -= buffer_m
+    maxx += buffer_m
+    miny -= buffer_m
+    maxy += buffer_m
+
+    # Find grid cells within bbox
+    x_inds = np.where((x >= minx) & (x <= maxx))[0]
+    y_inds = np.where((y >= miny) & (y <= maxy))[0]
+
+    if len(x_inds) == 0 or len(y_inds) == 0:
+        raise ValueError(
+            f"No rainfall grid cells overlap catchment.\n"
+            f"Catchment bbox: {(minx, miny, maxx, maxy)}\n"
+            f"Rainfall X range: {(x.min(), x.max())}\n"
+            f"Rainfall Y range: {(y.min(), y.max())}"
+        )
+
+    imin, imax = y_inds.min(), y_inds.max()
+    jmin, jmax = x_inds.min(), x_inds.max()
+
+    return obs_cube[..., imin:imax+1, jmin:jmax+1]
+
 def mask_to_catchment(obs_cube, gdf, y_coord='projection_y_coordinate', x_coord='projection_x_coordinate'):
     """
     Mask cells outside the catchment polygon boundary (not just its bbox).
